@@ -19,12 +19,13 @@
 
 addon.name    = 'weatherchecker';
 addon.author  = 'Monti';
-addon.version = '1.1';
+addon.version = '1.2';
 addon.desc    = 'Weather predictions and reminders for LSB-based servers.';
 addon.link    = '';
 
 require('common');
 local chat = require('chat');
+local settings = require('settings');
 
 --------------------------------------------------------------------------------------------------
 -- Vana'diel time
@@ -251,6 +252,41 @@ local function find_zone(query)
     return bestMatch.zid, bestMatch.name;
 end
 
+-- Some zones are manually merged into one named region for cross-zone
+-- weather searches, so a search doesn't spam near-duplicate rows for zones
+-- that happen to roll identically. This is a deliberate, curated list --
+-- NOT automatic detection -- so add entries here by hand as needed; every
+-- zone not listed just shows under its own name as normal.
+local MANUAL_REGIONS = {
+    { name = 'Qufim Region', zoneIds = { 126, 127, 157, 158, 184 } }, -- Qufim Island, Behemoth's Dominion, Lower/Middle/Upper Delkfutt's Tower
+};
+
+-- Builds ZONE_GROUPS: one entry per manual region above (using its first
+-- listed zone's table -- the whole point of grouping them is that they're
+-- identical), plus one singleton entry per zone that isn't part of any
+-- manual region. Used only by "/w <weather>" (no zone given); looking up a
+-- specific zone by name always shows just that zone under its own name.
+local ZONE_GROUPS = (function()
+    local groups = {};
+    local grouped = {}; -- zoneId -> true, so singleton zones can skip anything already covered
+
+    for _, region in ipairs(MANUAL_REGIONS) do
+        local firstZone = ZONES[region.zoneIds[1]];
+        if (firstZone ~= nil) then
+            groups[#groups + 1] = { displayName = region.name, cps = firstZone.cps };
+            for _, zid in ipairs(region.zoneIds) do grouped[zid] = true; end
+        end
+    end
+
+    for zid, zone in pairs(ZONES) do
+        if (not grouped[zid]) then
+            groups[#groups + 1] = { displayName = zone.name, cps = zone.cps };
+        end
+    end
+
+    return groups;
+end)();
+
 --------------------------------------------------------------------------------------------------
 -- Prediction logic
 --
@@ -263,8 +299,22 @@ end
 --------------------------------------------------------------------------------------------------
 
 local MAX_STEPS_PER_ZONE = CYCLE_LENGTH_DAYS * 2; -- safety bound: never search more than 2 full cycles
-local MAX_ZONES_SHOWN = 10;                       -- cap for "all zones" searches, so results stay readable
-local ROWS_PER_LOOKUP = 3;                        -- fixed number of upcoming entries any lookup shows
+local MAX_ROWS = 30;                              -- hard cap on rows per lookup, regardless of default or override
+
+-- Persisted per-character: how many entries a lookup shows when no per-command
+-- override is given. Defaults to 3, changeable with "/w default <#>".
+local default_settings = T{ default_days = 3 };
+local config = settings.load(default_settings);
+settings.register('settings', 'weatherchecker_settings_update', function (s)
+    if (s ~= nil) then config = s; end
+end);
+
+local function clamp_row_count(n)
+    n = math.floor(n);
+    if (n < 1) then n = 1; end
+    if (n > MAX_ROWS) then n = MAX_ROWS; end
+    return n;
+end
 
 -- Does weather id `wid` satisfy `filter`? (see ALIAS_TO_FILTER above for the
 -- filter format.) An empty slot (wid == 0) never matches anything.
@@ -279,15 +329,16 @@ local function weather_matches(wid, filter)
     return tostring(wid) == value; -- kind == 'id'
 end
 
--- Returns up to `rowsCap` upcoming change-point rows for a single zone. If
--- `weatherFilter` isn't 'all', only rows where the filter matches at least
--- one of the three slots are included -- but all three slot values are still
--- returned, so the caller can show full context around the match.
-local function find_zone_rows(zid, weatherFilter, nowDay, rowsCap)
-    local zone = ZONES[zid];
-    if (zone == nil or #zone.cps == 0) then return {}; end
-    local changePoints = zone.cps;
+-- Core walk: returns up to `rowsCap` upcoming change-point rows for a given
+-- name + changepoint table. Used directly by both find_zone_rows (a single,
+-- specifically-named zone) and find_all_zones (one call per zone GROUP, see
+-- ZONE_GROUPS above). If `weatherFilter` isn't 'all', only rows where the
+-- filter matches at least one of the three slots are included -- but all
+-- three slot values are still returned, so the caller can show full context
+-- around the match.
+local function find_rows_for(displayName, changePoints, weatherFilter, nowDay, rowsCap)
     local pointCount = #changePoints;
+    if (pointCount == 0) then return {}; end
 
     local cycleNumber = math.floor(nowDay / CYCLE_LENGTH_DAYS);
     local dayInCycle = nowDay % CYCLE_LENGTH_DAYS;
@@ -327,7 +378,7 @@ local function find_zone_rows(zid, weatherFilter, nowDay, rowsCap)
             local nextAbsoluteDay = ((cycleNumber + nextCycleOffset) * CYCLE_LENGTH_DAYS) + nextPoint[1];
 
             rows[#rows + 1] = {
-                zoneName = zone.name, startDay = displayDay, endDay = nextAbsoluteDay,
+                zoneName = displayName, startDay = displayDay, endDay = nextAbsoluteDay,
                 normal = normalW, common = commonW, rare = rareW,
                 matchNormal = matchNormal, matchCommon = matchCommon, matchRare = matchRare,
             };
@@ -338,22 +389,31 @@ local function find_zone_rows(zid, weatherFilter, nowDay, rowsCap)
     return rows;
 end
 
--- Searches every zone for matches, sorted so the soonest-occurring zone comes
--- first, capped to MAX_ZONES_SHOWN zones so a common weather type doesn't
--- flood the chat log.
-local function find_all_zones(weatherFilter, nowDay, rowsPerZone)
-    local candidates = {};
-    for zid, _ in pairs(ZONES) do
-        local rows = find_zone_rows(zid, weatherFilter, nowDay, rowsPerZone);
-        if (#rows > 0) then
-            candidates[#candidates + 1] = { zid = zid, rows = rows };
-        end
+-- A single, specifically-named zone (e.g. from "/w qufim ..."), ungrouped --
+-- always shows that exact zone's own name even if others share its table.
+local function find_zone_rows(zid, weatherFilter, nowDay, rowsCap)
+    local zone = ZONES[zid];
+    if (zone == nil) then return {}; end
+    return find_rows_for(zone.name, zone.cps, weatherFilter, nowDay, rowsCap);
+end
+
+-- "/w <weather>" with no zone given: searches every zone GROUP (see
+-- ZONE_GROUPS -- zones sharing an identical table are merged into one entry
+-- so they don't spam the results with duplicate-looking rows for the same
+-- moment), then flattens everything into a single list sorted soonest-first
+-- and truncated to `totalCap` -- e.g. "/w fire 5" means the next 5 actual
+-- occurrences, not 5 per zone.
+local function find_all_zones(weatherFilter, nowDay, totalCap)
+    local pool = {};
+    for _, group in ipairs(ZONE_GROUPS) do
+        local rows = find_rows_for(group.displayName, group.cps, weatherFilter, nowDay, totalCap);
+        for _, r in ipairs(rows) do pool[#pool + 1] = r; end
     end
-    table.sort(candidates, function (a, b) return a.rows[1].startDay < b.rows[1].startDay; end);
+    table.sort(pool, function (a, b) return a.startDay < b.startDay; end);
 
     local results = {};
-    for i = 1, math.min(MAX_ZONES_SHOWN, #candidates) do
-        results[i] = candidates[i];
+    for i = 1, math.min(totalCap, #pool) do
+        results[i] = pool[i];
     end
     return results;
 end
@@ -447,6 +507,24 @@ local function allocate_reminder_id()
     return nil;
 end
 
+-- Persists the currently active reminders so they survive a relog, addon
+-- reload, or client restart. `pending` (which thresholds are left to fire)
+-- is deliberately NOT saved -- it's recomputed fresh from targetDay whenever
+-- reminders are restored, so it's always correct for whatever time has
+-- actually passed, rather than trusting stale state from before.
+local function save_reminders()
+    local saved = {};
+    for _, rem in ipairs(reminders) do
+        saved[#saved + 1] = {
+            id = rem.id, zoneName = rem.zoneName,
+            common = rem.common, normal = rem.normal, rare = rem.rare,
+            targetDay = rem.targetDay,
+        };
+    end
+    config.reminders = saved;
+    settings.save();
+end
+
 -- Fog (id 3) is NOT part of the zone_weather table at all -- per LSB's
 -- src/map/zone.cpp, it's a runtime override applied AFTER the normal roll:
 -- if the current Vana'diel time is 2:00-7:00 AM, the zone isn't a city, and
@@ -491,6 +569,7 @@ local function arm_reminder(row)
         common = row.common, normal = row.normal, rare = row.rare,
         targetDay = row.startDay, pending = pending,
     };
+    save_reminders();
     say_ok(string.format('Reminder (%d) set: %s -- %s -- in %s',
         id, row.zoneName, triple, format_hours(minsUntil / 60)));
 end
@@ -521,12 +600,51 @@ local function cancel_reminder(idText)
     for i, rem in ipairs(reminders) do
         if (rem.id == id) then
             table.remove(reminders, i);
+            save_reminders();
             say('Cancelled reminder (' .. id .. ').');
             return;
         end
     end
     say_err('No reminder (' .. id .. ') -- see /w remind for your current list.');
 end
+
+-- Runs once when the addon loads: brings back whatever reminders were active
+-- last time, recomputed against the LIVE clock rather than trusting
+-- whatever was true when they were saved. Anything that would have already
+-- started while you were offline just gets announced immediately instead of
+-- silently vanishing; everything else comes back with correctly-adjusted
+-- warning thresholds (so you don't get a "60 minutes until" for something
+-- that's actually 10 minutes out because time passed while you were away).
+local function restore_reminders()
+    if (config.reminders == nil or #config.reminders == 0) then return; end
+    local nowSeconds = get_weather_seconds();
+    local restoredCount = 0;
+
+    for _, saved in ipairs(config.reminders) do
+        local minsUntil = minutes_until(saved.targetDay, nowSeconds);
+        if (minsUntil <= 0) then
+            say_ok(weather_triple_label(saved) .. ' weather has already started in ' ..
+                   saved.zoneName .. ' (while you were away).');
+        else
+            local pending = {};
+            for _, threshold in ipairs(WARNING_THRESHOLDS) do
+                if (threshold < minsUntil) then pending[#pending + 1] = threshold; end
+            end
+            reminders[#reminders + 1] = {
+                id = saved.id, zoneName = saved.zoneName,
+                common = saved.common, normal = saved.normal, rare = saved.rare,
+                targetDay = saved.targetDay, pending = pending,
+            };
+            restoredCount = restoredCount + 1;
+        end
+    end
+
+    if (restoredCount > 0) then
+        say('Restored ' .. restoredCount .. ' reminder' .. (restoredCount == 1 and '' or 's') .. ' from your last session.');
+    end
+    save_reminders(); -- drop anything that already fired from the saved list, so it isn't re-announced next time
+end
+restore_reminders();
 
 --------------------------------------------------------------------------------------------------
 -- Command handling
@@ -558,7 +676,7 @@ end
 
 -- Runs a lookup and prints numbered rows, remembering the result so
 -- "/w remind <#>" can reference it afterward.
-local function handle_lookup(zoneQuery, weatherFilter)
+local function handle_lookup(zoneQuery, weatherFilter, rowsCap)
     if (weatherFilter == 'id:3') then
         say(FOG_EXPLANATION);
         return;
@@ -569,15 +687,12 @@ local function handle_lookup(zoneQuery, weatherFilter)
     local header;
 
     if (zoneQuery == '') then
-        -- No zone given -- search every zone for the soonest matches.
-        local groups = find_all_zones(weatherFilter, nowDay, ROWS_PER_LOOKUP);
-        if (#groups == 0) then
+        -- No zone given -- search every zone (grouped/deduplicated) for the
+        -- soonest matches, already flattened and capped to rowsCap total.
+        rows = find_all_zones(weatherFilter, nowDay, rowsCap);
+        if (#rows == 0) then
             say_err('No zones found with that weather in the searchable horizon.');
             return;
-        end
-        rows = {};
-        for _, group in ipairs(groups) do
-            for _, r in ipairs(group.rows) do rows[#rows + 1] = r; end
         end
         header = 'Soonest matches, across zones:';
     else
@@ -586,7 +701,7 @@ local function handle_lookup(zoneQuery, weatherFilter)
             say_err('Unknown zone: "' .. zoneQuery .. '"');
             return;
         end
-        rows = find_zone_rows(zid, weatherFilter, nowDay, ROWS_PER_LOOKUP);
+        rows = find_zone_rows(zid, weatherFilter, nowDay, rowsCap);
         if (#rows == 0) then
             say_err('No matching weather found for ' .. zoneName .. ' in the searchable horizon.');
             return;
@@ -625,10 +740,13 @@ end
 
 local function print_help()
     say_ok('WeatherChecker commands:');
-    say('/w                    - current zones next 3 days of weather.');
-    say('/w <zone>             - specified zones next 3 days of weather.');
-    say('/w <zone> <weather>   - specified zones next 3 instances of a specified weather type.');
+    say('/w                    - current zones next ' .. config.default_days .. ' days of weather.');
+    say('/w <zone>             - specified zones next ' .. config.default_days .. ' days of weather.');
+    say('/w <zone> <weather>   - specified zones next ' .. config.default_days .. ' instances of a specified weather type.');
     say('/w <weather>          - soonest match for that weather, per zone, across all zones.');
+    say('/w ... <#>            - add a number (1-' .. MAX_ROWS .. ') at the end of any lookup above to show');
+    say('                        that many instead, e.g. "/w qufim 5".');
+    say('/w default <#>        - set your default entry count (currently ' .. config.default_days .. ') for future lookups.');
     say('/w remind             - gives a time remaining on your currently set reminders.');
     say('/w remind <#>         - sets a reminder for the (#) row from the last lookup.');
     say('/w cancel <#>         - cancels the reminder for the (#) in your reminder list.');
@@ -649,6 +767,21 @@ local function print_help()
     say('get at it.');
 end
 
+-- If the last token is a plain integer, pop it off and return it (clamped to
+-- 1..MAX_ROWS) plus the remaining tokens -- lets any lookup end with a number
+-- to override the default row count just for that command, e.g. "/w qufim 5".
+local function pop_trailing_count(tokens)
+    local n = #tokens;
+    if (n == 0) then return nil, tokens; end
+    local last = tokens[n];
+    if (last:match('^%d+$') ~= nil) then
+        local remaining = {};
+        for i = 1, n - 1 do remaining[i] = tokens[i]; end
+        return clamp_row_count(tonumber(last)), remaining;
+    end
+    return nil, tokens;
+end
+
 ashita.events.register('command', 'weatherchecker_command_cb', function (e)
     local args = e.command:args();
     if (#args == 0 or not args[1]:any('/w')) then
@@ -663,7 +796,7 @@ ashita.events.register('command', 'weatherchecker_command_cb', function (e)
             say_err('No weather data for your current zone.');
             return;
         end
-        handle_lookup(zoneName, 'all');
+        handle_lookup(zoneName, 'all', config.default_days);
         return;
     end
 
@@ -674,10 +807,30 @@ ashita.events.register('command', 'weatherchecker_command_cb', function (e)
     if (rest[1] == 'remind') then handle_remind(rest[2]); return; end
     if (rest[1] == 'cancel') then cancel_reminder(rest[2]); return; end
 
+    if (rest[1] == 'default') then
+        if (rest[2] == nil) then
+            say('Current default entry count: ' .. config.default_days);
+            return;
+        end
+        local n = tonumber(rest[2]);
+        if (n == nil) then
+            say_err('Usage: /w default <#>  (1-' .. MAX_ROWS .. ')');
+            return;
+        end
+        config.default_days = clamp_row_count(n);
+        settings.save();
+        say_ok('Default entry count set to ' .. config.default_days .. '.');
+        return;
+    end
+
     -- Anything else is a lookup: some combination of zone name and/or weather
-    -- keyword. parse_args sorts out which tokens are which.
-    local weatherFilter, zoneQuery = parse_args(rest);
-    handle_lookup(zoneQuery, weatherFilter);
+    -- keyword, optionally ending in a number to override the row count just
+    -- for this one command. parse_args sorts out which remaining tokens are
+    -- which.
+    local count, trimmed = pop_trailing_count(rest);
+    local rowsCap = count or config.default_days;
+    local weatherFilter, zoneQuery = parse_args(trimmed);
+    handle_lookup(zoneQuery, weatherFilter, rowsCap);
 end);
 
 --------------------------------------------------------------------------------------------------
@@ -718,6 +871,7 @@ ashita.events.register('d3d_present', 'weatherchecker_present_cb', function ()
 
         if (#rem.pending == 0) then
             table.remove(reminders, i); -- done -- frees its id for reuse
+            save_reminders();
         else
             i = i + 1;
         end
