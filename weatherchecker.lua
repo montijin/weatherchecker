@@ -329,6 +329,18 @@ local function weather_matches(wid, filter)
     return tostring(wid) == value; -- kind == 'id'
 end
 
+-- Plain-text description of a filter, for headers like "Soonest matches for
+-- wind weather:". Specific-tier filters (e.g. "earth2") describe as their
+-- element, same as everywhere else weather is displayed by element only.
+local function weather_filter_label(filter)
+    if (filter == 'all') then return 'any'; end
+    local kind, value = filter:match('^(%a+):(.+)$');
+    if (kind == 'el') then return value; end
+    local meta = WEATHER_META[tonumber(value)];
+    if (meta == nil or meta.element == 'none') then return 'none'; end
+    return meta.element;
+end
+
 -- Core walk: returns up to `rowsCap` upcoming change-point rows for a given
 -- name + changepoint table. Used directly by both find_zone_rows (a single,
 -- specifically-named zone) and find_all_zones (one call per zone GROUP, see
@@ -694,7 +706,7 @@ local function handle_lookup(zoneQuery, weatherFilter, rowsCap)
             say_err('No zones found with that weather in the searchable horizon.');
             return;
         end
-        header = 'Soonest matches, across zones:';
+        header = 'Soonest matches for ' .. weather_filter_label(weatherFilter) .. ' weather:';
     else
         local zid, zoneName = find_zone(zoneQuery);
         if (zid == nil) then
