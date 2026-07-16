@@ -1,23 +1,26 @@
 --[[
 * WeatherChecker - Ashita v4 addon
 *
-* Shows upcoming zone weather for LSB-based FFXI servers, and lets you set
+* Predicts upcoming zone weather for LSB-based FFXI servers, and lets you set
 * reminders that count down to a specific upcoming weather window.
 *
 * Vana'diel time reading is ported from clockvana.lua (atom0s, modified by
 * Almavivaconte: https://github.com/ConteAlmaviva/clockvana), itself based on
 * the Ashita v3 `vanatime` lib. Credit to atom0s / Almavivaconte for the
-* memory signature and timestamp math 
+* memory signature and timestamp math -- this addon adds the weather-table
+* lookups and reminder system on top of it.
 *
 * Weather table data is sourced from LandSandBoat's `base` branch
 * (sql/zone_weather.sql + sql/zone_settings.sql), pre-decoded into
-* data/weather_data.lua by gen_weather_data.py
+* data/weather_data.lua by gen_weather_data.py. See README.md for how to
+* regenerate that file from your own server's database if it customizes
+* zone weather.
 --]]
 
 addon.name    = 'weatherchecker';
 addon.author  = 'Monti';
-addon.version = '1.0';
-addon.desc    = 'Weather look-up and reminders for LSB-based servers.';
+addon.version = '1.1';
+addon.desc    = 'Weather predictions and reminders for LSB-based servers.';
 addon.link    = '';
 
 require('common');
@@ -27,7 +30,8 @@ local chat = require('chat');
 -- Vana'diel time
 --
 -- The game client keeps its own Vana'diel clock in memory. Reading it directly
--- which means this addon is always exactly in sync with the server, with no risk of
+-- (rather than reconstructing it from the real-world clock + an epoch guess)
+-- means this addon is always exactly in sync with the server, with no risk of
 -- drift or timezone mistakes.
 --------------------------------------------------------------------------------------------------
 
@@ -45,7 +49,9 @@ local function get_vana_seconds()
     return (raw + 92514960) * 25;
 end
 
--- Current absolute Vana'diel day count (a day is 86400 vana-seconds).
+-- Current absolute Vana'diel day count (a day is 86400 vana-seconds), in the
+-- CLIENT's calendar-display epoch -- this is the number that matches /clock's
+-- displayed Y/M/D directly, with no offset needed.
 local function get_vana_day()
     return math.floor(get_vana_seconds() / 86400);
 end
@@ -53,20 +59,49 @@ end
 local CYCLE_LENGTH_DAYS = 2160; -- the zone weather tables repeat on this cycle
 local DAYTYPE_NAMES = { 'Firesday', 'Earthsday', 'Watersday', 'Windsday', 'Iceday', 'Lightningday', 'Lightsday', 'Darksday' };
 
--- Converts an absolute Vana'diel day into a calendar date, matching what
--- /clock shows in-game: 12 months of 30 days, 360-day years, epoch year 886.
+-- IMPORTANT: the SERVER's weather table is NOT indexed using the calendar-
+-- display day count above. Per src/common/vana_time.h, the server's raw
+-- Vana'diel clock is zeroed at year 0, not year 886 (get_year() there is
+-- explicitly commented "years since 886" and does NOT add 886 -- callers are
+-- expected to). The zone weather system (src/map/zone.cpp, UpdateWeather())
+-- indexes its table using that RAW, un-shifted day count directly. The
+-- client's memory (what get_vana_day() above reads) is already in shifted,
+-- calendar-ready space, so weather-table lookups need this offset backed out
+-- first -- otherwise every lookup silently searches 886 years in the wrong
+-- place in the table. (Found this the hard way: a live in-game weather
+-- observation didn't match what this addon predicted, and it traced back to
+-- exactly this 886-year/318960-day gap.)
+local WEATHER_EPOCH_SHIFT_DAYS = 886 * 360;
+
+-- The day count to use for ALL weather-table math (cycle indexing, row
+-- start/end days, countdowns). Never use get_vana_day()/get_vana_seconds()
+-- directly for weather lookups -- only for calendar display.
+local function get_weather_day()
+    return get_vana_day() - WEATHER_EPOCH_SHIFT_DAYS;
+end
+local function get_weather_seconds()
+    return get_vana_seconds() - (WEATHER_EPOCH_SHIFT_DAYS * 86400);
+end
+
+-- Converts a day number FROM WEATHER-EPOCH SPACE (i.e. one of find_zone_rows'
+-- row.startDay/endDay values) into the calendar date /clock would show for
+-- that same moment: 12 months of 30 days, 360-day years, shifted back into
+-- calendar-display space before the usual month/day/weekday math.
 -- (Lua's % is floor-mod, so this works correctly for any sign of `day`.)
-local function day_to_calendar(day)
+local function day_to_calendar(weatherDay)
+    local day = weatherDay + WEATHER_EPOCH_SHIFT_DAYS;
     local dayOfYear = day % 360;
-    local year = 886 + math.floor(day / 360);
+    local year = math.floor(day / 360);
     local month = math.floor(dayOfYear / 30) + 1;
     local dayOfMonth = (dayOfYear % 30) + 1;
     local weekday = DAYTYPE_NAMES[(day % 8) + 1];
     return year, month, dayOfMonth, weekday;
 end
 
--- Real-world hours remaining until a target Vana'diel day boundary, computed
--- directly against the live vana-seconds clock.
+-- Real-world hours remaining until a target day boundary. `targetDay` and
+-- `nowVanaSeconds` must be in the SAME day-space (both weather-epoch space,
+-- in every actual call site below) -- the function itself is space-agnostic,
+-- it just measures the gap between the two.
 local function hours_until(targetDay, nowVanaSeconds)
     local deltaVanaSeconds = (targetDay * 86400) - nowVanaSeconds;
     return (deltaVanaSeconds / 25) / 3600; -- /25 converts vana-seconds back to real seconds
@@ -173,6 +208,9 @@ end
 --------------------------------------------------------------------------------------------------
 
 -- Loaded via an explicit path anchored to this addon's own folder (addon.path)
+-- rather than require(), since require()'s search-path resolution depends on
+-- exactly how/where Ashita was launched, and was a real source of "module not
+-- found" errors during development that had nothing to do with a missing file.
 local dataPath = addon.path .. 'data\\weather_data.lua';
 local dataChunk, dataLoadError = loadfile(dataPath);
 if (dataChunk == nil) then
@@ -269,24 +307,30 @@ local function find_zone_rows(zid, weatherFilter, nowDay, rowsCap)
         local cycleOffset = math.floor((i - 1) / pointCount);
         local absoluteDay = ((cycleNumber + cycleOffset) * CYCLE_LENGTH_DAYS) + point[1];
 
-        if (absoluteDay >= nowDay) then
-            local normalW, commonW, rareW = point[2], point[3], point[4];
-            local matchNormal = weather_matches(normalW, weatherFilter);
-            local matchCommon = weather_matches(commonW, weatherFilter);
-            local matchRare = weather_matches(rareW, weatherFilter);
+        -- The very first entry (i == startIndex) is "whatever's in effect right
+        -- now" -- if today isn't itself a change-point day, this entry's OWN day
+        -- is in the past (it carried forward from an earlier change-point), but
+        -- its effect is still active today. Display it as today, not its
+        -- original day. Every later entry in the walk is a real future
+        -- change-point, so this never affects anything past the first row.
+        local displayDay = math.max(absoluteDay, nowDay);
 
-            if (weatherFilter == 'all' or matchNormal or matchCommon or matchRare) then
-                local nextPointIndex = ((i) % pointCount) + 1;
-                local nextPoint = changePoints[nextPointIndex];
-                local nextCycleOffset = math.floor(i / pointCount);
-                local nextAbsoluteDay = ((cycleNumber + nextCycleOffset) * CYCLE_LENGTH_DAYS) + nextPoint[1];
+        local normalW, commonW, rareW = point[2], point[3], point[4];
+        local matchNormal = weather_matches(normalW, weatherFilter);
+        local matchCommon = weather_matches(commonW, weatherFilter);
+        local matchRare = weather_matches(rareW, weatherFilter);
 
-                rows[#rows + 1] = {
-                    zoneName = zone.name, startDay = absoluteDay, endDay = nextAbsoluteDay,
-                    normal = normalW, common = commonW, rare = rareW,
-                    matchNormal = matchNormal, matchCommon = matchCommon, matchRare = matchRare,
-                };
-            end
+        if (weatherFilter == 'all' or matchNormal or matchCommon or matchRare) then
+            local nextPointIndex = ((i) % pointCount) + 1;
+            local nextPoint = changePoints[nextPointIndex];
+            local nextCycleOffset = math.floor(i / pointCount);
+            local nextAbsoluteDay = ((cycleNumber + nextCycleOffset) * CYCLE_LENGTH_DAYS) + nextPoint[1];
+
+            rows[#rows + 1] = {
+                zoneName = zone.name, startDay = displayDay, endDay = nextAbsoluteDay,
+                normal = normalW, common = commonW, rare = rareW,
+                matchNormal = matchNormal, matchCommon = matchCommon, matchRare = matchRare,
+            };
         end
         i = i + 1;
         steps = steps + 1;
@@ -328,7 +372,7 @@ local function say_ok(msg)
     print(chat.header(addon.name):append(chat.success(msg)));
 end
 
--- Elemental weather always renders in the highlighted color so it
+-- Elemental weather always renders in the dark-green "success" color so it
 -- stands out at a glance; non-elemental "None" stays plain, since it's never
 -- what anyone's actually hunting for.
 local function weather_cell(wid)
@@ -348,13 +392,21 @@ end
 
 -- Prints one lookup result row, numbered "(idx)" so it can be referenced later
 -- with "/w remind <idx>".
+--
+-- NOTE: this is built as ONE continuous chained expression, not split across
+-- separate statements. Ashita's chat message objects are immutable builders
+-- -- :append() returns a NEW combined object rather than mutating the
+-- receiver -- so `line:append(x); line:append(y)` on separate statements
+-- silently discards everything after the first append. (This was a real bug
+-- during development: chat output showed only the header and dropped all the
+-- weather data.)
 local function print_row(r, idx)
     local year, month, dayOfMonth, weekday = day_to_calendar(r.startDay);
     local whenText;
-    if (r.startDay <= get_vana_day()) then
+    if (r.startDay <= get_weather_day()) then
         whenText = 'Today';
     else
-        whenText = 'in ' .. format_hours(hours_until(r.startDay, get_vana_seconds()));
+        whenText = 'in ' .. format_hours(hours_until(r.startDay, get_weather_seconds()));
     end
     local header = string.format('(%d) %s -- %d/%d/%d (%s) -- %s  ',
         idx, r.zoneName, year, month, dayOfMonth, weekday, whenText);
@@ -414,7 +466,7 @@ local FOG_EXPLANATION =
 -- effectively passed, so it's skipped rather than firing an inaccurate
 -- "60 minutes until" a moment after being set.
 local function arm_reminder(row)
-    local minsUntil = minutes_until(row.startDay, get_vana_seconds());
+    local minsUntil = minutes_until(row.startDay, get_weather_seconds());
     local triple = weather_triple_label(row);
 
     if (minsUntil <= 0) then
@@ -455,7 +507,7 @@ local function list_reminders()
     table.sort(sorted, function (a, b) return a.id < b.id; end);
 
     for _, rem in ipairs(sorted) do
-        local timeLeft = format_hours(hours_until(rem.targetDay, get_vana_seconds()));
+        local timeLeft = format_hours(hours_until(rem.targetDay, get_weather_seconds()));
         say(string.format('(%d) %s -- %s -- in %s', rem.id, rem.zoneName, weather_triple_label(rem), timeLeft));
     end
 end
@@ -512,7 +564,7 @@ local function handle_lookup(zoneQuery, weatherFilter)
         return;
     end
 
-    local nowDay = get_vana_day();
+    local nowDay = get_weather_day();
     local rows;
     local header;
 
@@ -591,9 +643,10 @@ local function print_help()
     say_ok('How the weather itself actually works:');
     say('Each zone has 3 possible weather types lined up for any given Vanadiel day: a Common');
     say('one (35% chance), a Normal one (50% chance), and a Rare one (15% chance). The server');
-    say('re-rolls between those 3 options every 3-30 real-world minutes');
+    say('re-rolls between those 3 options every 3-30 real-world minutes while youre in the zone --');
     say('so a listed window being active means that weather CAN show up, not that it definitely');
-    say('will on any single day.');
+    say('will on any single roll. The longer a window stays open, the more independent rolls you');
+    say('get at it.');
 end
 
 ashita.events.register('command', 'weatherchecker_command_cb', function (e)
@@ -629,6 +682,9 @@ end);
 
 --------------------------------------------------------------------------------------------------
 -- Reminder polling
+--
+-- Throttled to once every 5 real-world seconds -- checking every frame would
+-- be wasteful, and this is plenty precise for minute-granularity warnings.
 --------------------------------------------------------------------------------------------------
 
 local lastPollTime = 0;
@@ -641,7 +697,7 @@ ashita.events.register('d3d_present', 'weatherchecker_present_cb', function ()
     lastPollTime = now;
 
     if (#reminders == 0) then return; end
-    local nowSeconds = get_vana_seconds();
+    local nowSeconds = get_weather_seconds();
     local i = 1;
     while (i <= #reminders) do
         local rem = reminders[i];
