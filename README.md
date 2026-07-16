@@ -162,7 +162,4 @@ add more.
   by Almavivaconte), itself based on Ashita v3's `vanatime` library. The
   memory signature and timestamp math are theirs — this addon adds the
   weather-table lookups and reminder system on top.
-- Weather table data and the day-resolution algorithm come from
-  [LandSandBoat](https://github.com/LandSandBoat/server)'s `base` branch.
-=======
 
