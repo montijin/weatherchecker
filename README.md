@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # WeatherChecker
 
 An Ashita v4 addon for LSB-based FFXI servers that shows the upcoming zone
