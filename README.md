@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # WeatherChecker
 
 An Ashita v4 addon for LSB-based FFXI servers that shows the upcoming zone
@@ -163,3 +164,7 @@ add more.
   weather-table lookups and reminder system on top.
 - Weather table data and the day-resolution algorithm come from
   [LandSandBoat](https://github.com/LandSandBoat/server)'s `base` branch.
+=======
+# weatherchecker
+An Ashitav4 addon that shows upcoming zone weather for LSB-based FFXI servers, and lets you set reminders that count down to a specific upcoming weather window.
+>>>>>>> 63451adbb492a0b28a5a9f4e80a5b18190aed41f
