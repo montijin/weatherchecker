@@ -8,7 +8,7 @@ table of "on this day, the possible weather is A (50%), B (35%), or C (15%)".
 This addon reads that table directly (baked into `data/weather_data.lua`
 ahead of time) and cross-references it against the game's live Vana'diel
 clock, so it can tell you exactly when a weather type becomes possible in any
-zone it knows about — no guessing, no waiting around.
+zone.
 
 ## Install
 
